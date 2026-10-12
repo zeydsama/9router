@@ -6,6 +6,8 @@ import { FORMATS } from "../../translator/formats.js";
 import { PROVIDERS } from "../../config/providers.js";
 import { buildRequestDetail, extractRequestConfig, saveUsageStats, formatDoneLine } from "./requestDetail.js";
 import { ROLE, RESPONSES_ITEM } from "../../translator/schema/index.js";
+import { fromOpenAIFinish } from "../../translator/concerns/finishReason.js";
+import { DEFAULT_THINKING_CLAUDE_SIGNATURE } from "../../config/defaultThinkingSignature.js";
 
 // Responses-API providers (e.g. codex) may emit SSE without content-type + use Responses output shape
 const isResponsesProvider = (p) => PROVIDERS[p]?.format === FORMATS.OPENAI_RESPONSES;
@@ -103,6 +105,81 @@ function chatCompletionToResponses(responseBody, customToolNames = null) {
       output_tokens: usage.completion_tokens || usage.output_tokens || 0,
       total_tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
     },
+  };
+}
+
+function chatCompletionToClaudeMessage(responseBody) {
+  if (!responseBody?.choices?.[0]) return responseBody;
+  const choice = responseBody.choices[0];
+  const message = choice.message || {};
+  const content = [];
+
+  const reasoning = message.reasoning_content || message.provider_specific_fields?.reasoning_content || "";
+  if (reasoning) {
+    content.push({
+      type: "thinking",
+      thinking: reasoning,
+      signature: message.thought_signature || DEFAULT_THINKING_CLAUDE_SIGNATURE
+    });
+  }
+  if (typeof message.content === "string" && message.content.length > 0) {
+    content.push({ type: "text", text: message.content });
+  }
+  for (const toolCall of message.tool_calls || []) {
+    const fn = toolCall.function || {};
+    let args = {};
+    if (fn.arguments) {
+      if (typeof fn.arguments === "object") args = fn.arguments;
+      else {
+        try { args = JSON.parse(fn.arguments); } catch {}
+      }
+    }
+    content.push({
+      type: "tool_use",
+      id: toolCall.id || `toolu_${Date.now()}_${content.length}`,
+      name: fn.name || toolCall.name || "",
+      input: args,
+    });
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
+
+  const usage = responseBody.usage || {};
+  const promptTokens = usage.prompt_tokens || usage.input_tokens || 0;
+  const completionTokens = usage.completion_tokens || usage.output_tokens || 0;
+  const cachedTokens = usage.prompt_tokens_details?.cached_tokens;
+  const cacheCreationTokens = usage.prompt_tokens_details?.cache_creation_tokens;
+  const cacheReadTokens = typeof cachedTokens === "number" ? cachedTokens : 0;
+  const cacheCreateTokens = typeof cacheCreationTokens === "number" ? cacheCreationTokens : 0;
+  const inputTokens = Math.max(0, promptTokens - cacheReadTokens - cacheCreateTokens);
+
+  let stopReason = fromOpenAIFinish(choice.finish_reason, FORMATS.CLAUDE);
+  if (message.tool_calls && message.tool_calls.length > 0) {
+    stopReason = "tool_use";
+  } else if (!stopReason || stopReason === "stop") {
+    stopReason = "end_turn";
+  }
+
+  let rawId = String(responseBody.id || "").replace(/^chatcmpl-/, "");
+  if (!rawId || rawId.length < 8) rawId = `${Date.now()}`;
+  const finalId = rawId.startsWith("msg_") ? rawId : `msg_${rawId}`;
+
+  const claudeUsage = {
+    input_tokens: inputTokens,
+    output_tokens: completionTokens,
+  };
+  if (cacheReadTokens > 0) claudeUsage.cache_read_input_tokens = cacheReadTokens;
+  if (cacheCreateTokens > 0) claudeUsage.cache_creation_input_tokens = cacheCreateTokens;
+
+  return {
+    id: finalId,
+    type: "message",
+    role: "assistant",
+    model: responseBody.model || "unknown",
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    stop_details: stopReason === "refusal" ? { type: "refusal", category: "general_harms" } : null,
+    usage: claudeUsage,
   };
 }
 
@@ -267,6 +344,20 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
             responseId: jsonResponse.id || `resp_${Date.now()}`
           }
         };
+      } else if (sourceFormat === FORMATS.CLAUDE) {
+        const message = { role: "assistant", content: textContent || (hasToolCalls ? null : "") };
+        if (hasToolCalls) message.tool_calls = toolCalls;
+        const responseDone = jsonResponse.status === "completed" || jsonResponse.status === "done";
+        const finishReason = hasToolCalls ? "tool_calls" : (responseDone ? "stop" : (jsonResponse.status || "stop"));
+        const intermediateOpenAI = {
+          id: jsonResponse.id || `chatcmpl-${Date.now()}`,
+          object: "chat.completion",
+          created: jsonResponse.created_at || Math.floor(Date.now() / 1000),
+          model: jsonResponse.model || model,
+          choices: [{ index: 0, message, finish_reason: finishReason }],
+          usage: { prompt_tokens: inTokens, completion_tokens: outTokens, total_tokens: inTokens + outTokens, ...cacheDetails }
+        };
+        finalResp = chatCompletionToClaudeMessage(intermediateOpenAI);
       } else {
         const message = { role: "assistant", content: textContent || (hasToolCalls ? null : "") };
         if (hasToolCalls) message.tool_calls = toolCalls;
@@ -358,7 +449,9 @@ export async function handleForcedSSEToJson({ providerResponse, sourceFormat, ta
     // already imports parseSSEToOpenAIResponse from this module.
     const finalBody = sourceFormat === FORMATS.OPENAI_RESPONSES
       ? chatCompletionToResponses(parsed, customToolNames)
-      : parsed;
+      : (sourceFormat === FORMATS.CLAUDE
+        ? chatCompletionToClaudeMessage(parsed)
+        : parsed);
 
     return { success: true, response: new Response(JSON.stringify(restoreToolNames(finalBody, toolNameMap)), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } }) };
   } catch (err) {
