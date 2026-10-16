@@ -13,7 +13,7 @@ function parseToolArguments(value) {
   }
 }
 
-export function openAICompletionToClaudeMessage(responseBody) {
+export function openAICompletionToClaudeMessage(responseBody, options = {}) {
   if (!responseBody?.choices?.[0]) return responseBody;
   const choice = responseBody.choices[0];
   const message = choice.message || {};
@@ -21,9 +21,12 @@ export function openAICompletionToClaudeMessage(responseBody) {
 
   const reasoning = message.reasoning_content || message.provider_specific_fields?.reasoning_content || "";
   if (reasoning) {
+    const isOmitted = options?.thinkingDisplay === "omitted"
+      || options?.body?.thinking?.display === "omitted"
+      || responseBody?._thinkingDisplay === "omitted";
     content.push({
       type: CLAUDE_BLOCK.THINKING,
-      thinking: reasoning,
+      thinking: isOmitted ? "" : reasoning,
       signature: message.thought_signature || DEFAULT_THINKING_CLAUDE_SIGNATURE,
     });
   }
